@@ -1,0 +1,10 @@
+# Build files
+obj/
+*.o
+server
+
+# Mac
+.DS_Store
+
+# Python
+__pycache__/
