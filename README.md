@@ -1,9 +1,17 @@
-High-Performance Multithreaded TCP ServerA robust, low-level TCP server implementation written in C++17 utilizing the POSIX Socket API. This project serves as a demonstration of core systems programming, featuring a custom thread pool, manual synchronization primitives, and a producer-consumer architecture.Architecture OverviewThe server utilizes a Producer-Consumer model to decouple connection acceptance from request processing.Plaintext                ┌─────────────────────────────────────────────────────────┐
+# Multithreaded TCP Server
+
+A production-quality, multithreaded TCP server built from scratch in **C++17** using raw **POSIX APIs** — no frameworks, no abstractions, just systems programming.
+
+---
+
+## Architecture
+```
+                ┌─────────────────────────────────────────────────────────┐
                 │                    SERVER PROCESS                       │
                 │                                                         │
   Client ──►    │   ┌──────────┐   accept()    ┌───────────────────┐     │
   Client ──►    │   │ TcpServer│ ─────────────►│    Task Queue     │     │
-  Client ──►    │   │ (listen) │               │  std::queue<int>  │     │
+  Client ──►    │   │ (listen) │               │  queue<int>       │     │
                 │   └──────────┘               │  (mutex + condvar)│     │
                 │        ▲                     └────────┬──────────┘     │
                 │        │ SIGINT                       │                 │
@@ -18,19 +26,129 @@ High-Performance Multithreaded TCP ServerA robust, low-level TCP server implemen
                 │                              │  └─────┘ └─────┘ │     │
                 │                              └───────────────────┘     │
                 └─────────────────────────────────────────────────────────┘
-Producer (Main Thread): Executes the accept() loop and pushes client file descriptors into a synchronized queue.Consumer (Worker Threads): Dequeue descriptors, manage client I/O, and execute the request-response cycle.Technical SpecificationsComponentImplementation DetailsNetworkingPOSIX Sockets (socket, bind, listen, accept)Concurrencypthread library for thread lifecycle managementSynchronizationpthread_mutex_t and pthread_cond_t for thread-safe queue operationsResource ManagementRAII (Resource Acquisition Is Initialization) for automated socket/thread cleanupSignal Handlingsig_atomic_t flags and custom SIGINT handlers for graceful terminationNetwork ConfigurationSO_REUSEADDR enabled for immediate port recovery upon restartProject StructurePlaintext.
+
+  Producer:  Main thread calls accept() → pushes client fd into queue
+  Consumer:  Worker threads dequeue fds → handle client I/O → close
+```
+
+The main thread acts as the **producer** — it runs an `accept()` loop and pushes incoming client file descriptors into a thread-safe queue. A fixed pool of **worker threads** act as **consumers**, blocking on a condition variable when idle and waking up to handle connections as they arrive. This decouples connection acceptance from request handling, so the main thread is never stalled by slow clients.
+
+---
+
+## Features
+
+| Feature | Implementation |
+|---|---|
+| **POSIX Sockets** | Raw `socket()`, `bind()`, `listen()`, `accept()` |
+| **Thread Pool** | `pthread_create`, `pthread_join`, configurable worker count |
+| **Mutex** | `pthread_mutex_t` — protects shared task queue |
+| **Condition Variable** | `pthread_cond_t` — workers sleep when idle, no busy-waiting |
+| **Graceful Shutdown** | `SIGINT` handler drains queue, joins threads, closes sockets |
+| **RAII** | Destructors handle socket and thread cleanup automatically |
+| **Thread-Safe Logging** | Per-thread prefixed output: `[Thread <id>] handling client <fd>` |
+| **SO_REUSEADDR** | Instant restarts without `Address already in use` errors |
+
+---
+
+## Project Structure
+```
+Multithreaded-TCP-Server/
 ├── src/
-│   ├── main.cpp           # Entry point and signal handling logic
-│   ├── TcpServer.cpp      # Socket lifecycle and listener implementation
-│   └── ThreadPool.cpp     # Worker thread management and task synchronization
+│   ├── main.cpp           # Entry point, accept loop (producer), SIGINT handler
+│   ├── TcpServer.cpp      # POSIX socket lifecycle
+│   └── ThreadPool.cpp     # Thread pool with producer-consumer queue
 ├── include/
-│   ├── TcpServer.h        # Server class definitions
-│   └── ThreadPool.h       # ThreadPool and TaskQueue definitions
+│   ├── TcpServer.h
+│   └── ThreadPool.h
 ├── tests/
-│   └── stress_test.py     # Automated concurrency testing script
-├── Makefile               # Standardized build system (C++17)
+│   └── stress_test.py     # 100-client concurrent stress test
+├── Makefile               # C++17, -Wall -Wextra -Wpedantic
 └── README.md
-Installation and UsagePrerequisitesPOSIX-compliant operating system (Linux or macOS)C++17 compatible compiler (GCC or Clang)Python 3.x (for automated testing)BuildTo compile the project with optimized flags:Bashmake
-ExecutionStart the server on the default port (8080):Bash./server
-TestingTo verify the server's stability under load, run the concurrent stress test:Bashpython3 tests/stress_test.py
-Performance MetricsThe following metrics were observed during local testing on a standard Unix environment:Concurrency: Successfully handled 100+ simultaneous persistent connections.Latency: Average response time < 5ms per echo request.Stability: Zero memory leaks or resource deadlocks identified during long-running stress tests.Shutdown: Verified clean exit of all threads and release of the port within < 1 second of SIGINT.Technical Design DecisionsWhy a fixed-size Thread Pool?Creating a new thread per connection introduces significant overhead and risks memory exhaustion under high traffic. By using a pre-allocated pool, we bound system resource usage and minimize context-switching overhead.How is the Producer-Consumer pattern implemented?The TaskQueue uses a monitor-style synchronization approach. When the queue is empty, worker threads are put to sleep via pthread_cond_wait, consuming zero CPU cycles. The main thread wakes exactly one worker via pthread_cond_signal whenever a new connection is accepted.How is Graceful Shutdown ensured?Upon receiving SIGINT, the server breaks the accept loop, sets a shutdown flag in the ThreadPool, and broadcasts a signal to all condition variables. This ensures that even idle workers wake up, finalize their state, and are properly joined before the process terminates.AuthorAakash Jawle Computer Engineering Student | Systems & Machine Learning Intern
+```
+
+---
+
+## Build & Run
+
+### Prerequisites
+
+- C++17 compiler (`g++` or `clang++`)
+- POSIX-compliant OS (Linux / macOS)
+- Python 3 (for stress test only)
+
+### Build
+```bash
+make
+```
+
+### Run
+```bash
+./server
+```
+
+### Connect with netcat
+```bash
+nc localhost 8080
+# Type a message and see it echoed back
+```
+
+### Stress test — 100 concurrent clients
+```bash
+python3 tests/stress_test.py
+```
+
+### Clean
+```bash
+make clean
+```
+
+### Graceful shutdown
+
+Press `Ctrl+C` while the server is running:
+```
+[Signal] SIGINT received — initiating shutdown...
+[Main] Shutdown flag set — exiting accept loop.
+[ThreadPool] All 4 threads joined.
+[TcpServer] Socket closed.
+[Main] Server shut down cleanly. Goodbye!
+```
+
+---
+
+## Performance
+
+| Metric | Result |
+|---|---|
+| Concurrent clients | 100+ |
+| Worker threads | 4 (configurable) |
+| Avg response time | < 5ms per client |
+| Memory per thread | ~1MB stack (default) |
+| Shutdown | Clean, no resource leaks |
+
+---
+
+## Concepts
+
+### Operating Systems
+
+- Thread lifecycle management with `pthread_create` and `pthread_join`
+- Mutual exclusion via `pthread_mutex_t`
+- Condition variables: `pthread_cond_wait` / `pthread_cond_signal`
+- Producer-consumer synchronization pattern
+- Signal handling with `SIGINT`, `sigaction`, and `volatile sig_atomic_t`
+- RAII-based resource management
+
+### Networking
+
+- TCP socket programming (connection-oriented, reliable)
+- Full socket API usage: `socket()`, `bind()`, `listen()`, `accept()`
+- Client communication with `send()` / `recv()`
+- `SO_REUSEADDR` for rapid server restarts
+- IPv4 addressing with `sockaddr_in` and `INADDR_ANY`
+
+### Software Engineering
+
+- Modular C++ design with clean header/source separation
+- Structured error handling using exceptions and `perror()`
+- Makefile build system with proper dependency tracking
+- Automated concurrent stress testing
