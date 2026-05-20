@@ -1,215 +1,209 @@
 /**
  * @file main.cpp
- * @brief Entry point — integrates TcpServer + ThreadPool + SIGINT handling.
+ * @brief MTCP Server — entry point. Wires all components, runs accept loop.
  *
- * Architecture:
- *   ┌────────────┐     accept()     ┌─────────────┐    enqueue()    ┌────────────┐
- *   │   Client   │ ──────────────► │  TcpServer   │ ─────────────► │ ThreadPool │
- *   │ (external) │                 │ (listener)   │                │ (workers)  │
- *   └────────────┘                 └─────────────┘                └────────────┘
- *                                        │                              │
- *                                        │         clientHandler()      │
- *                                        │  ◄───────────────────────────│
- *                                        │         send/recv/close      │
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  ARCHITECTURE
+ * ═══════════════════════════════════════════════════════════════════════════
  *
- * Signal Handling (SIGINT / Ctrl+C):
- *   - A signal handler sets a global flag (volatile sig_atomic_t).
- *   - The accept loop checks this flag each iteration.
- *   - On SIGINT: break accept loop → shutdown thread pool → close server.
+ *  ┌────────┐  accept()  ┌─────────────┐  enqueue(fd)  ┌─────────────────┐
+ *  │ Client │ ─────────► │  TcpServer  │ ────────────► │   ThreadPool    │
+ *  │        │            │  (listen)   │               │  worker-0 .. N  │
+ *  └────────┘            └─────────────┘               └────────┬────────┘
+ *                              │                                │
+ *                          SIGINT                        handleClient(fd, idx)
+ *                              │                         recvLine() loop
+ *                              │                         sendAll() echo
+ *                              ▼                                │
+ *                        g_shutdown=1                    Metrics update
+ *                              │
+ *                              ▼
+ *                   accept() → EINTR → loop exits
+ *                              │
+ *                        pool.shutdown()
+ *                    (broadcast + drain + join)
+ *                              │
+ *                        server.close()
+ *                              │
+ *                       final metrics dump
  *
- *   Why volatile sig_atomic_t?
- *   ──────────────────────────
- *   - volatile: tells compiler "don't optimize reads of this variable;
- *     it can change at any time (from a signal handler)."
- *   - sig_atomic_t: guaranteed to be read/written atomically by the CPU,
- *     so no torn reads between the main thread and the signal handler.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  SIGNAL HANDLING
+ * ═══════════════════════════════════════════════════════════════════════════
  *
- *   Why is graceful shutdown important in production?
- *   ─────────────────────────────────────────────────
- *   1. Resource leaks: unclosed sockets exhaust file descriptors.
- *   2. Port exhaustion: TIME_WAIT sockets pile up.
- *   3. Data corruption: clients mid-transfer get broken pipes.
- *   4. Zombie threads: unjoined threads leak resources.
- *   5. Audit/compliance: graceful shutdown is a production requirement.
+ *  SIGINT  (Ctrl+C):
+ *    sigaction() — sets g_shutdown=1, write() is async-signal-safe.
+ *    SA_RESTART deliberately NOT set: accept() returns EINTR on signal,
+ *    allowing the accept loop to check g_shutdown and break cleanly.
+ *
+ *  SIGPIPE (broken pipe):
+ *    signal(SIGPIPE, SIG_IGN) — process-wide ignore.
+ *    sendAll() uses MSG_NOSIGNAL per-call as belt-and-suspenders.
+ *    Without this, a single client disconnect during send() kills the server.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  STATS THREAD
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  A background pthread dumps Metrics every cfg.statsInterval seconds.
+ *  Uses a 1s sleep loop (not a single long sleep) so it exits quickly
+ *  when g_shutdown is set, without needing a condvar or pipe.
  */
 
-#include "TcpServer.h"
-#include "ThreadPool.h"
+#include "net/TcpServer.h"
+#include "core/ThreadPool.h"
+#include "core/Config.h"
+#include "util/Logger.h"
+#include "util/Metrics.h"
+#include "handler/ClientHandler.h"
 
-#include <iostream>
-#include <cstring>       // strlen, memset
-#include <unistd.h>      // close, read, write
-#include <signal.h>      // signal, SIGINT
-#include <pthread.h>     // pthread_self
+#include <signal.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <cstring>
+#include <stdexcept>
+#include <string>
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Configuration
-// ═════════════════════════════════════════════════════════════════════════════
-static constexpr int    SERVER_PORT    = 8080;
-static constexpr int    THREAD_COUNT   = 4;
-static constexpr int    BUFFER_SIZE    = 4096;
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Global shutdown flag (signal-safe)
-// ═════════════════════════════════════════════════════════════════════════════
+// ── Global shutdown flag (written by signal handler, read by main loop) ───────
 static volatile sig_atomic_t g_shutdown = 0;
 
-/**
- * SIGINT handler — sets the shutdown flag.
- * Note: only async-signal-safe operations are allowed here.
- * Setting a sig_atomic_t variable IS safe.
- * std::cout / printf are NOT safe (but we avoid them).
- */
-static void signalHandler(int signum)
-{
-    (void)signum;  // unused
+// ── SIGINT handler ────────────────────────────────────────────────────────────
+//   Only async-signal-safe operations are permitted here:
+//     - Setting a sig_atomic_t variable: ✅ safe
+//     - write() to a file descriptor:    ✅ safe (POSIX guaranteed)
+//     - printf / std::cout:              ❌ NOT safe (locks, buffering)
+static void onSigInt(int /*signum*/) {
     g_shutdown = 1;
-    // write() is async-signal-safe, unlike printf/cout
-    const char msg[] = "\n[Signal] SIGINT received — initiating shutdown...\n";
+    const char msg[] = "\n[Signal] SIGINT — initiating graceful shutdown...\n";
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-result"
     write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+#pragma GCC diagnostic pop
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Client Handler — runs inside a WORKER THREAD (consumer)
-// ═════════════════════════════════════════════════════════════════════════════
-/**
- * Handles a single client connection:
- *   1. Send a greeting
- *   2. Receive a message from the client
- *   3. Echo the message back
- *   4. Close the socket
- *
- * Thread-safe: each invocation operates on its own clientFd.
- * No shared state is accessed (no need for locks here).
- */
-static void clientHandler(int clientFd)
-{
-    // ── Thread-safe logging ──────────────────────────────────────────
-    //   pthread_self() returns the calling thread's ID.
-    //   Each worker prints which client it's handling.
-    pthread_t tid = pthread_self();
-    std::cout << "[Thread " << tid << "] Handling client fd=" << clientFd << "\n";
+// ── Metrics stats thread ──────────────────────────────────────────────────────
+struct StatsThreadArg { int intervalSecs; };
 
-    // ── Step 1: Send greeting ────────────────────────────────────────
-    const char* greeting = "Hello from server! Send me a message:\n";
-    ssize_t sent = ::send(clientFd, greeting, strlen(greeting), 0);
-    if (sent < 0) {
-        perror("[Handler] send greeting failed");
-        ::close(clientFd);
-        return;
-    }
+static void* statsThreadFn(void* arg) {
+    const StatsThreadArg* sa = static_cast<StatsThreadArg*>(arg);
+    int ticksSinceLastDump   = 0;
 
-    // ── Step 2: Receive message from client ──────────────────────────
-    char buffer[BUFFER_SIZE];
-    std::memset(buffer, 0, sizeof(buffer));
-
-    ssize_t bytesRead = ::recv(clientFd, buffer, sizeof(buffer) - 1, 0);
-    if (bytesRead <= 0) {
-        if (bytesRead == 0) {
-            std::cout << "[Thread " << tid << "] Client fd=" << clientFd
-                      << " disconnected.\n";
-        } else {
-            perror("[Handler] recv failed");
+    // 1-second tick loop — allows fast exit when g_shutdown is set
+    // without blocking in a long sleep that would delay final join
+    while (!g_shutdown) {
+        sleep(1);
+        ++ticksSinceLastDump;
+        if (!g_shutdown && ticksSinceLastDump >= sa->intervalSecs) {
+            Metrics::get().dump();
+            ticksSinceLastDump = 0;
         }
-        ::close(clientFd);
-        return;
     }
-
-    buffer[bytesRead] = '\0';
-    std::cout << "[Thread " << tid << "] Received from fd=" << clientFd
-              << ": " << buffer;
-
-    // ── Step 3: Echo message back ────────────────────────────────────
-    std::string echo = "Echo: " + std::string(buffer);
-    ::send(clientFd, echo.c_str(), echo.size(), 0);
-
-    // ── Step 4: Close the client socket ──────────────────────────────
-    //   Each worker is responsible for closing its own client fd.
-    //   Forgetting this would leak file descriptors.
-    ::close(clientFd);
-    std::cout << "[Thread " << tid << "] Closed client fd=" << clientFd << "\n";
+    return nullptr;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Main — PRODUCER (accept loop)
-// ═════════════════════════════════════════════════════════════════════════════
-int main()
-{
-    // ── Register SIGINT handler ──────────────────────────────────────
-    //   Overrides default behavior (which is to terminate immediately).
-    //   Now Ctrl+C sets g_shutdown=1 instead.
+// ── main ─────────────────────────────────────────────────────────────────────
+int main(int argc, char** argv) {
+    // ── Parse CLI configuration ───────────────────────────────────────────────
+    ServerConfig cfg = parseArgs(argc, argv);
+
+    // ── Logger setup (before any other component logs anything) ──────────────
+    if (cfg.verbose)
+        Logger::get().setLevel(LogLevel::DEBUG);
+
+    // ── Print effective configuration ─────────────────────────────────────────
+    printConfig(cfg);
+
+    // ── SIGPIPE: ignore globally ──────────────────────────────────────────────
+    //   sendAll() uses MSG_NOSIGNAL per-call, but SIG_IGN is belt-and-suspenders.
+    //   Without both, a race between SIGPIPE delivery and MSG_NOSIGNAL could
+    //   slip through on some kernel versions.
+    signal(SIGPIPE, SIG_IGN);
+
+    // ── SIGINT: graceful shutdown handler ─────────────────────────────────────
+    //   sigaction() is preferred over signal() — it has defined semantics on
+    //   all POSIX platforms and supports fine-grained flag control.
     struct sigaction sa{};
-    sa.sa_handler = signalHandler;
+    sa.sa_handler = onSigInt;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;  // No SA_RESTART: we WANT accept() to be interrupted
+    sa.sa_flags = 0;   // NO SA_RESTART — accept() must return EINTR on signal
     if (sigaction(SIGINT, &sa, nullptr) < 0) {
-        perror("sigaction");
+        Logger::get().error("[Main] sigaction(SIGINT) failed: " +
+                            std::string(strerror(errno)));
         return 1;
     }
 
-    std::cout << "═══════════════════════════════════════════════════\n"
-              << "  Multithreaded TCP Server (POSIX)                \n"
-              << "  Port: " << SERVER_PORT << "  |  Workers: " << THREAD_COUNT << "\n"
-              << "  Press Ctrl+C to shut down gracefully            \n"
-              << "═══════════════════════════════════════════════════\n\n";
+    // ── Initialize client handler with config ─────────────────────────────────
+    initClientHandler(cfg);
 
-    // ── Create and start TCP server ──────────────────────────────────
-    TcpServer server(SERVER_PORT);
+    // ── Start TCP server ──────────────────────────────────────────────────────
+    TcpServer server(cfg.port, cfg.backlog);
     try {
         server.start();
-    } catch (const std::runtime_error& e) {
-        std::cerr << "[FATAL] " << e.what() << "\n";
+    } catch (const std::runtime_error& ex) {
+        Logger::get().error("[Main] FATAL — " + std::string(ex.what()));
         return 1;
     }
 
-    // ── Create thread pool ───────────────────────────────────────────
-    //   The handler function is passed to each worker thread.
-    //   Workers will call clientHandler(fd) for each dequeued task.
-    ThreadPool pool(THREAD_COUNT, clientHandler);
+    // ── Start thread pool ─────────────────────────────────────────────────────
+    ThreadPool pool(cfg.threads, cfg.queueDepth, handleClient);
 
-    // ════════════════════════════════════════════════════════════════
+    // ── Start metrics dump thread ─────────────────────────────────────────────
+    pthread_t    statsTid{};
+    StatsThreadArg statsArg{cfg.statsInterval};
+    if (cfg.statsInterval > 0) {
+        pthread_create(&statsTid, nullptr, statsThreadFn, &statsArg);
+        Logger::get().info("[Main] Stats thread started (interval=" +
+                           std::to_string(cfg.statsInterval) + "s)");
+    }
+
+    Logger::get().info("[Main] Server ready — press Ctrl+C to stop\n");
+
+    // ══════════════════════════════════════════════════════════════════════════
     // PRODUCER LOOP (main thread)
-    // ════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
     //
-    //   The main thread is the PRODUCER in the producer-consumer model.
-    //   It accepts new client connections and pushes their socket fds
-    //   into the thread pool's shared queue.
+    //   The main thread is the PRODUCER in the producer-consumer pattern.
+    //   It calls accept() in a tight loop, pushing each accepted fd into the
+    //   ThreadPool's bounded queue.
     //
-    //   The CONSUMER worker threads pick up these fds and process them.
+    //   accept() blocks until a client connects.  When SIGINT arrives:
+    //     1. The OS delivers the signal — calls onSigInt()
+    //     2. onSigInt() sets g_shutdown=1
+    //     3. accept() is interrupted, returns -1 with errno=EINTR
+    //     4. The loop checks g_shutdown and breaks
     //
-    std::cout << "[Main] Waiting for connections...\n\n";
-
     while (!g_shutdown) {
-        // ── accept() blocks until a client connects ──────────────────
-        //   When SIGINT arrives, accept() returns -1 with errno=EINTR.
-        //   We check g_shutdown and break the loop.
         int clientFd = server.acceptConnection();
 
         if (clientFd < 0) {
-            if (g_shutdown) {
-                std::cout << "[Main] Shutdown flag set — exiting accept loop.\n";
-                break;
-            }
-            // Transient error (e.g., EINTR without shutdown) — retry
+            if (g_shutdown) break;                    // SIGINT — expected
+            if (errno == EINTR) continue;             // other signal — retry
+            Logger::get().warn("[Main] accept() transient error: " +
+                               std::string(strerror(errno)));
             continue;
         }
 
-        // ── PRODUCER: push client socket into the shared queue ───────
-        //   This is the "produce" step: we're adding work for consumers.
+        // PRODUCER: push fd into shared queue
+        // enqueue() handles backpressure: returns false + closes fd if full
         pool.enqueue(clientFd);
     }
 
-    // ════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
     // GRACEFUL SHUTDOWN
-    // ════════════════════════════════════════════════════════════════
-    std::cout << "\n[Main] Initiating graceful shutdown...\n";
+    // ══════════════════════════════════════════════════════════════════════════
+    Logger::get().info("[Main] Shutdown: draining thread pool...");
+    pool.shutdown();        // broadcast → workers drain queue → join all threads
 
-    // 1. Shut down thread pool (signals all workers, joins threads)
-    pool.shutdown();
-
-    // 2. Close the listening socket
+    Logger::get().info("[Main] Shutdown: closing listening socket...");
     server.close();
 
-    std::cout << "[Main] Server shut down cleanly. Goodbye!\n";
+    // Join stats thread (it will see g_shutdown and exit within 1 second)
+    if (cfg.statsInterval > 0 && statsTid != 0)
+        pthread_join(statsTid, nullptr);
+
+    // Final metrics snapshot
+    Metrics::get().dump();
+
+    Logger::get().info("[Main] Clean shutdown complete. Goodbye!");
     return 0;
 }
